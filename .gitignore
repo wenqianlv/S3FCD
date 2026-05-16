@@ -1,0 +1,79 @@
+# -------------------------- 通用系统/IDE文件 --------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.ipynb_checkpoints
+
+# -------------------------- Python 环境相关 --------------------------
+venv/
+env/
+.venv/
+.conda/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.venv
+
+# -------------------------- 深度学习训练专属忽略 --------------------------
+# 1. 模型权重/训练产物（绝对不要提交，体积大且无意义）
+*.pth
+*.pt
+*.onnx
+*.h5
+*.pb
+checkpoints/
+saved_model/
+output/
+results/
+inference_output/
+
+# 2. 训练日志/可视化文件
+logs/
+wandb/
+tensorboard/
+events.out.tfevents.*
+*.tfevents.*
+infer/
+work_dirs/
+
+# 3. 数据集（如果数据集放在项目里，不要提交；如果是单独管理的可以忽略整个data文件夹）
+data/
+raw_data/
+
+# 4. 训练临时文件
+*.tmp
+*.bak
+train_log/
+eval_result/
+temp/
+
+# -------------------------- 敏感/环境配置 --------------------------
+# 环境变量/密钥（绝对不能提交！）
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+# 你之前误操作的.ssh目录绝对不能提交
+.ssh/
+
+# -------------------------- AutoDL 容器专属忽略 --------------------------
+# AutoDL 临时缓存/挂载文件（按需添加）
+autodl-tmp/

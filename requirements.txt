@@ -1,0 +1,6 @@
+thop
+albumentations
+change_detection_pytorch
+loguru
+einops
+imgaug

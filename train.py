@@ -1,0 +1,323 @@
+import argparse
+import os
+import sys
+import random
+
+import albumentations as A
+import numpy as np
+import torch
+from loguru import logger
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from build import *
+from utils import Metric, ModelEma, itp_bil, show_images
+
+
+def run(args):
+
+    rank = args.local_rank
+    bs = args.bs
+    nw = args.workers
+    lr = args.lr
+    pv = args.period_val
+    pp = args.period_print
+    epochs = args.epochs
+    work_dir = args.work_dir
+    ema = args.ema
+    decay_ema = args.decay_ema
+    decoder_attention_type = args.decoder_attention_type
+    f1_thr = args.f1_thr
+
+    os.system(f"mkdir -p {work_dir}")
+
+    device = torch.device(
+        f'cuda:{max(rank,0)}' if torch.cuda.is_available() else 'cpu')
+
+    # model
+    model = build_model(choice='cdp_UnetPlusPlus', encoder_name="timm-efficientnet-b0",
+                        encoder_weights="noisy-student",
+                        decoder_attention_type=decoder_attention_type,
+                        in_channels=3,
+                        classes=2,
+                        siam_encoder=True,
+                        fusion_form='concat',
+                        )
+    model = model.to(device)
+
+    # TODO(shinian) load checkpoint
+    if ema:
+        model_ema = ModelEma(model, decay=decay_ema)
+
+    if rank > -1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank],
+                                                          output_device=rank, find_unused_parameters=True)
+    if rank < 1:
+        logger.remove()
+        log_format = "<green>{time:MM-DD HH:mm:ss}</green> | <level>{level: <5}</level> | <level>{message}</level>"
+        logger.add(os.path.join(
+            work_dir, "train_{time:MM_DD_HH_mm_ss}.log"), colorize=True, format=log_format, serialize=False)
+        logger.add(sys.stdout, colorize=True, format=log_format, serialize=False)
+        logger.info(args)
+        logger.info(model)
+    # pipeline
+    train_pipeline = A.Compose([
+        A.RandomResizedCrop(width=512, height=512),
+        # A.HorizontalFlip(p=0.5),
+        # A.VerticalFlip(p=0.5), 
+        ],
+        additional_targets={'image1': 'image'})
+    val_pipeline = A.Compose([
+        A.HorizontalFlip(p=0.0), 
+        ],
+        additional_targets={'image1': 'image'})
+
+    # dataloader
+    train_set = build_dataset(choice='SYSUDataset',
+                             data_root="/root/autodl-tmp/dataset/CLCD",
+                             metafile = "/root/autodl-nas/code/Lab0330/configs/230413_base_w7r10_dmb_clcd_train_model/work_dirs/feat/230315_supervised_w10r5_dmb_train/train.6.txt",
+                            pipeline=train_pipeline,
+                            c255t1_in_mask=True,
+                            )
+
+    val_set = build_dataset(choice='CommonDataset',
+                             data_root="/root/autodl-tmp/dataset/CLCD",
+                             metafile="/root/autodl-tmp/dataset/CLCD/val.txt",
+                            pipeline=val_pipeline,
+                            c255t1_in_mask=True,
+                            )
+
+    train_sampler = DistributedSampler(train_set) if rank > -1 else None
+
+    train_loader = DataLoader(dataset=train_set,
+                              pin_memory=True,
+                              batch_size=bs,
+                              num_workers=nw,
+                              shuffle=False,
+                              drop_last=True,
+                              sampler=train_sampler)
+
+    val_loader = DataLoader(dataset=val_set,
+                            pin_memory=True,
+                            batch_size=bs//4,
+                            num_workers=4,
+                            shuffle=False,
+                            drop_last=False,
+                            sampler=None)
+
+    # loss
+    criterion = build_loss(choice='CrossEntropyLoss', 
+                            weight=torch.tensor((0.7, 1.0),
+                            device=torch.device(f'cuda:{rank}')))
+    # criterion = build_loss(choice='BCEWithLogitsLoss')
+
+    # optim
+    optimizer = build_optimizer(
+        model, choice='Adam', lr=lr, weight_decay=0)
+    
+
+    # lr_scheduler
+    lr_scheduler = build_scheduler(optimizer, choice='MultiStepLR',
+                                   milestones=[int(epochs*0.6), int(epochs*0.85)], gamma=0.1)
+
+    # metric
+    metric_train = Metric(init_metric={'f1': 0.0, 'iou': 0.0, 'pr': 0.0, 're': 0.0,})
+    metric_val = Metric(init_metric={'f1': 0.0, 'iou': 0.0, 'pr': 0.0, 're': 0.0,})
+    if ema:
+        metric_val_ema = Metric(init_metric={'f1': 0.0, 'iou': 0.0, 'pr': 0.0, 're': 0.0,})
+
+    # training
+    for epoch in range(epochs):
+
+        if rank > -1:
+            train_sampler.set_epoch(epoch)
+
+        metric_train.reset()
+        model.train()
+
+        if ema and rank < 1 and \
+                (metric_val.best_metric['f1'] >= f1_thr or \
+                    epoch >= int(epochs*0.85)) \
+                and model_ema.count_set < 1:
+                    
+            model_ema.set(model)
+            logger.info(
+                f'set the model_ema when {metric_val.print(local=False)}')
+
+        for batch, data in enumerate(train_loader):
+            total_batch = batch + epoch * len(train_loader)
+            
+            img1 = data[0].to(device)
+            img2 = data[1].to(device)
+            label = data[2].to(device)
+
+            optimizer.zero_grad()
+            pred = model(img1, img2)
+            if isinstance(pred, (list, tuple)) and not isinstance(pred[0], (list, tuple)):
+                # import pdb;pdb.set_trace()
+                loss_cd = [criterion(pre, itp_bil(
+                    pre, label.shape[-2:])) for pre in pred]
+                loss = sum(loss_cd)/len(loss_cd)
+                output = pred[0].argmax(dim=1)
+            else:
+                loss = criterion(pred, label)
+                output = pred.argmax(dim=1)
+                
+            if random.random() < 0.5:
+                suffix = random.randint(0,3)
+                vis_path = os.path.join(work_dir, f'train_{suffix}.jpg')
+                show_images([img1[0,...].permute(1,2,0), img2[0,...].permute(1,2,0), 
+                             label[0,...], output[0,...]], vis_path)
+            loss.backward()
+            optimizer.step()
+            
+            if ema and model_ema.count_set > 0:
+                model_ema.update(model)
+
+            metric_train(output, label)
+
+            # FIXME(shinian) gather output/loss/metric on different ranks in DDP
+            if ((batch+1) % pp == 0 or (batch+1) == len(train_loader)) and rank < 1:
+                local = batch != len(train_loader)-1
+                state = "T" if local else "E"
+                pstr = f"[{state}] e:{epoch+1:2d}/{epochs:2d} | b:{batch+1:3d}/{len(train_loader)} | " + \
+                       f"lr: {lr_scheduler.get_last_lr()[0]:.3e} | " + \
+                       f"{metric_train.print(local)} | " + \
+                       f"loss:{loss.item():.3e}"
+                # print(pstr)
+                logger.info(pstr)
+
+            # validation
+            if ((total_batch+1) % pv == 0) and rank < 1:
+            # if ((epoch+1) % pv == 0 or (epoch+1) == epochs) and rank < 1:
+                save_dict = {}
+                local = False
+                metric_val.reset()
+                res, loss = validate(
+                    model, val_loader, criterion, metric_val, device, work_dir=work_dir)
+                pstr = f"[V] e:{epoch+1:2d}/{epochs:2d} | b:{len(val_loader):3d}/{len(val_loader)} | " + \
+                    f"lr: {lr_scheduler.get_last_lr()[0]:.3e} | " + \
+                    f"{metric_val.print(local,with_best=True)} | " + \
+                    f"loss:{loss.item():.3e}"
+                logger.info(pstr)
+                save_dict['state_dict'] = (model.module if hasattr(
+                    model, 'module') else model).state_dict()
+                save_name = f"epoch_{epoch+1}_{metric_val.print(local,sep0='_',sep1='_')}"
+
+                if ema and model_ema.count_set > 0:
+                    metric_val_ema.reset()
+                    res, loss = validate(
+                        model_ema.module, val_loader, criterion, metric_val_ema, device, work_dir=work_dir)
+                    pstr = f"[A] e:{epoch+1:2d}/{epochs:2d} | b:{len(val_loader):3d}/{len(val_loader)} | " + \
+                        f"lr: {lr_scheduler.get_last_lr()[0]:.3e} | " + \
+                        f"{metric_val_ema.print(local,with_best=True)} | " + \
+                        f"loss:{loss.item():.3e}"
+                    logger.info(pstr)
+                    save_dict['state_dict_ema'] = (model_ema.module if hasattr(
+                        model_ema, 'module') else model_ema).state_dict()
+                    save_name += f"_{metric_val_ema.print(local,sep0='_',sep1='_')}"
+
+                save_name += ".pth"
+                save_path = os.path.join(work_dir, save_name)
+                if metric_val.f1(False) >= f1_thr or \
+                    (ema and model_ema.count_set > 0 and metric_val_ema.f1(False) >= f1_thr):
+                    torch.save(save_dict, save_path)
+                    if ema and model_ema.count_set > 0:
+                        f1_thr = max(metric_val.f1(False), metric_val_ema.f1(False))
+                    else:
+                        f1_thr = metric_val.f1(False)
+
+        # after training
+        lr_scheduler.step()
+        metric_train.calculate(local=False)
+
+    return
+
+
+@torch.no_grad()
+def validate(model, val_loader, criterion, metric_val, device, work_dir):
+    state = model.training
+    model.eval()
+    loss_all = 0.0
+    for batch, data in enumerate(val_loader):
+        img1 = data[0].to(device)
+        img2 = data[1].to(device)
+        label = data[2].to(device)
+        pred = model(img1, img2)
+        loss_all += criterion(pred, label)
+        output = pred.argmax(dim=1)
+        metric_val(output, label)
+        if random.random() < 0.05:
+            suffix = random.randint(0,3)
+            vis_path = os.path.join(work_dir, f'val_{suffix}.jpg')
+            show_images([img1[0,...].permute(1,2,0), img2[0,...].permute(1,2,0), 
+                            label[0,...], output[0,...]], vis_path)
+    loss = loss_all / len(val_loader)
+    res = metric_val.calculate(local=False)
+    model = model.train(state)
+    return res, loss
+
+
+def init(args):
+    seed = args.seed
+    rank = args.local_rank
+    seed += rank
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if not (rank > -1):
+        return
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        backend='nccl',
+        init_method='env://',)
+
+    if torch.distributed.get_rank() == 0:
+        pass  # TODO(shinian) do something only in master rannk
+
+    return
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='train')
+
+    parser.add_argument('-seed',  type=int, default=1234,
+                        help='global random seed')
+    parser.add_argument('-bs',  type=int, default=16,
+                        help='batch size on each gpu')
+    parser.add_argument('-lr',  type=float, default=1e-3,
+                        help='learning rate')
+    parser.add_argument('-nw', '--workers',  type=int, default=2,
+                        help='number of workers for each gpu')
+    parser.add_argument('-ne', '--epochs',  type=int, default=30,
+                        help='number of epochs')
+    parser.add_argument('-pv', '--period_val',  type=int, default=1,
+                        help='perform validation every period')
+    parser.add_argument('-pp', '--period_print',  type=int, default=10,
+                        help='print log every period (batch)')
+    parser.add_argument('-wd', '--work_dir',  type=str, default='../work_dirs/',
+                        help='work dirs to save logs and ckpts')
+    parser.add_argument('--ema', action='store_true', default=False,
+                        help='use exponential moving average while training')
+    parser.add_argument('-de', '--decay_ema', type=float, default=0.99,
+                        help='decay factor for ema')
+    parser.add_argument('-dat', '--decoder_attention_type', type=str, default=None,
+                        help='decoder attention type')
+    parser.add_argument('-ft', '--f1_thr',  type=float, default=0.68,
+                        help='f1_thr used in ema and checkpoint')
+    parser.add_argument('--local_rank', type=int,
+                        default=-1, help='local rank for ddp')
+
+    args = parser.parse_args()
+
+    init(args)
+    run(args)
+
+
+if __name__ == '__main__':
+    main()
